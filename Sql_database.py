@@ -1,254 +1,298 @@
-"""
-Coastal Microplastic Monitoring & Cleanup Database (SQLite)
-
-This script generates a synthetic SQLite database from scratch (no external datasets).
-It is designed for coursework requirements:
-- Multiple related tables with foreign keys
-- At least one table with 1000+ rows (samples)
-- Nominal / ordinal / interval / ratio data types
-- Deliberate small amounts of missing and duplicate data for realism
-
-Run:
-  python3 database_commented.py
-
-Output:
-  coastal_microplastics_v3.sqlite
-"""
-
-
-import sqlite3, random, math, os
+import os
+import math
+import random
+import sqlite3
 from datetime import date, timedelta
-from collections import defaultdict, Counter
 
-DB_PATH = "coastal_microplastics_v3.sqlite"
-
-# DB_PATH controls the output file name. Using a single file keeps submission simple.
-
-SCHEMA_SQL = r'''# The schema is embedded so the DB can be rebuilt anywhere without extra files.
-# CHECK constraints are used to prevent impossible values and improve realism.
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS beaches (
-    beach_id     INTEGER PRIMARY KEY,
-    beach_name   TEXT NOT NULL,
-    region       TEXT NOT NULL,
-    latitude     REAL NOT NULL CHECK (latitude BETWEEN 49.0 AND 61.5),
-    longitude    REAL NOT NULL CHECK (longitude BETWEEN -8.5 AND 2.5),
-    risk_level   TEXT NOT NULL CHECK (risk_level IN ('Low','Medium','High','Critical'))
-);
-
-CREATE TABLE IF NOT EXISTS volunteers (
-    volunteer_id      INTEGER PRIMARY KEY,
-    signup_date       TEXT NOT NULL,
-    age_years         INTEGER NOT NULL CHECK (age_years BETWEEN 16 AND 90),
-    experience_level  TEXT NOT NULL CHECK (experience_level IN ('Beginner','Intermediate','Advanced')),
-    home_region       TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS cleanup_events (
-    event_id          INTEGER PRIMARY KEY,
-    beach_id          INTEGER NOT NULL,
-    event_date        TEXT NOT NULL,
-    start_hour        INTEGER NOT NULL CHECK (start_hour BETWEEN 0 AND 23),
-    duration_minutes  INTEGER NOT NULL CHECK (duration_minutes BETWEEN 15 AND 360),
-    temperature_c     REAL NOT NULL,
-    weather_type      TEXT,
-    FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT,
-    CHECK (weather_type IS NULL OR weather_type IN ('Sunny','Cloudy','Windy','Rain','Storm'))
-);
-
-CREATE TABLE IF NOT EXISTS event_volunteers (
-    event_id      INTEGER NOT NULL,
-    volunteer_id  INTEGER NOT NULL,
-    role          TEXT NOT NULL CHECK (role IN ('Collector','Sorter','DataEntry','Supervisor')),
-    hours_worked  REAL NOT NULL CHECK (hours_worked > 0 AND hours_worked <= 8),
-    PRIMARY KEY (event_id, volunteer_id),
-    FOREIGN KEY (event_id) REFERENCES cleanup_events(event_id)
-        ON UPDATE CASCADE ON DELETE CASCADE,
-    FOREIGN KEY (volunteer_id) REFERENCES volunteers(volunteer_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
-
-CREATE TABLE IF NOT EXISTS samples (
-    sample_id              INTEGER PRIMARY KEY,
-    beach_id               INTEGER NOT NULL,
-    collection_date        TEXT NOT NULL,
-    collection_method      TEXT NOT NULL CHECK (collection_method IN ('Transect','Quadrat','Grab','Sieve')),
-    dominant_polymer_type  TEXT,
-    plastic_density_mg_m2  REAL NOT NULL CHECK (plastic_density_mg_m2 >= 0),
-    pollution_severity     TEXT NOT NULL CHECK (pollution_severity IN ('Low','Moderate','High','Severe')),
-    FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
-
-CREATE TABLE IF NOT EXISTS lab_results (
-    result_id             INTEGER PRIMARY KEY,
-    sample_id             INTEGER NOT NULL UNIQUE,
-    microplastic_count    INTEGER NOT NULL CHECK (microplastic_count >= 0),
-    avg_particle_size_mm  REAL NOT NULL CHECK (avg_particle_size_mm >= 0),
-    analysis_method       TEXT NOT NULL CHECK (analysis_method IN ('FTIR','Raman','Microscopy','Py-GCMS')),
-    analyst_confidence    TEXT,
-    FOREIGN KEY (sample_id) REFERENCES samples(sample_id)
-        ON UPDATE CASCADE ON DELETE CASCADE,
-    CHECK (analyst_confidence IS NULL OR analyst_confidence IN ('Low','Medium','High'))
-);
-
-CREATE TABLE IF NOT EXISTS beach_daily_summary (
-    beach_id          INTEGER NOT NULL,
-    summary_date      TEXT NOT NULL,
-    sample_count      INTEGER NOT NULL CHECK (sample_count >= 0),
-    avg_density_mg_m2 REAL NOT NULL CHECK (avg_density_mg_m2 >= 0),
-    dominant_severity TEXT NOT NULL CHECK (dominant_severity IN ('Low','Moderate','High','Severe')),
-    PRIMARY KEY (beach_id, summary_date),
-    FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
-
-CREATE INDEX IF NOT EXISTS idx_samples_beach_date ON samples(beach_id, collection_date);
-CREATE INDEX IF NOT EXISTS idx_events_beach_date ON cleanup_events(beach_id, event_date);
-CREATE INDEX IF NOT EXISTS idx_lab_results_method ON lab_results(analysis_method);
-'''
+DB_PATH = "coastal_microplastics.sqlite"
 
 def choose_weighted(options, weights):
-    # Weighted selection avoids overly-uniform categorical data.
     r = random.random() * sum(weights)
-    upto = 0.0
-    for o, w in zip(options, weights):
-        upto += w
-        if upto >= r:
-            return o
+    s = 0.0
+    for opt, w in zip(options, weights):
+        s += w
+        if s >= r:
+            return opt
     return options[-1]
 
-def seasonal_temp_c(d):
-    # Seasonal model (interval scale): temperature varies through the year.
-    doy = d.timetuple().tm_yday
-    mean = 11 + 7 * math.sin(2 * math.pi * (doy - 205) / 365.0)
-    return round(mean + random.gauss(0, 2.0), 1)
 
-def severity_from_density(x):
-    # Ordinal label derived from ratio-scale density.
-    if x < 80: return "Low"
-    if x < 180: return "Moderate"
-    if x < 320: return "High"
-    return "Severe"
+# density -> ordinal label
+def severity_from_density(d):
+    if d < 60:
+        return "Low"
+    if d < 120:
+        return "Moderate"
+    if d < 220:
+        return "High"
+    return "Critical"
+
 
 def main():
-    # Seed makes results reproducible for marking.
     random.seed(42)
+
+    # start fresh
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
-    # Delete old DB so the script always builds from scratch.
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(SCHEMA_SQL)
 
-    # Table sizes are chosen to look realistic:
-    # - beaches is small (reference table)
-    # - volunteers and events are medium
-    # - samples and lab_results are large measurement tables
+    # schema
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = ON;
 
-    regions=["North","NorthWest","NorthEast","Midlands","East","SouthEast","SouthWest","South"]
-    risk_levels=["Low","Medium","High","Critical"]
-    polymer_types=["PET","PE","PP","PS","PVC","Nylon","PU","Other"]
-    collection_methods=["Transect","Quadrat","Grab","Sieve"]
-    weather_types=["Sunny","Cloudy","Windy","Rain","Storm"]
-    roles=["Collector","Sorter","DataEntry","Supervisor"]
-    experience_levels=["Beginner","Intermediate","Advanced"]
-    analysis_methods=["FTIR","Raman","Microscopy","Py-GCMS"]
-    confidence_levels=["Low","Medium","High"]
+        DROP TABLE IF EXISTS beach_daily_summary;
+        DROP TABLE IF EXISTS event_volunteers;
+        DROP TABLE IF EXISTS cleanup_events;
+        DROP TABLE IF EXISTS lab_results;
+        DROP TABLE IF EXISTS samples;
+        DROP TABLE IF EXISTS volunteers;
+        DROP TABLE IF EXISTS beaches;
 
-    beach_names=[]
-    # Deliberate duplicates: add a repeated beach name to mimic naming overlap.
-    for _ in range(28):
-        beach_names.append(f"{random.choice(['Sandy','Pebble','Harbour','Cliff','Dune','Seabrook','Brightwater','Driftwood','Silver','Blue'])} {random.choice(['Bay','Shore','Cove','Beach','Point','Sands'])}")
-    beach_names += ["Seabrook Bay","Seabrook Bay"]
-    random.shuffle(beach_names)
+        CREATE TABLE beaches (
+            beach_id INTEGER PRIMARY KEY,
+            beach_name TEXT NOT NULL,
+            region TEXT NOT NULL CHECK (region IN ('North','South','East','West')),
+            beach_type TEXT NOT NULL CHECK (beach_type IN ('Sandy','Rocky','Mixed')),
+            access_level TEXT NOT NULL CHECK (access_level IN ('Easy','Moderate','Hard')),
+            length_km REAL NOT NULL CHECK (length_km > 0),
+            protected_status TEXT NOT NULL CHECK (protected_status IN ('None','Local','National'))
+        );
 
-    beaches=[]
-    for i in range(1,31):
-        beaches.append((i,beach_names[i-1],random.choice(regions),round(49.0 + random.random()*12.5,5),round(-8.5 + random.random()*11.0,5),choose_weighted(risk_levels,[0.35,0.35,0.2,0.1])))
-    conn.executemany("INSERT INTO beaches VALUES (?,?,?,?,?,?)", beaches)
+        CREATE TABLE volunteers (
+            volunteer_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            age INTEGER NOT NULL CHECK (age BETWEEN 16 AND 80),
+            experience_level TEXT NOT NULL CHECK (experience_level IN ('New','Intermediate','Experienced')),
+            email TEXT,
+            phone TEXT
+        );
 
-    volunteers=[]
-    start_signup=date(2023,1,1)
-    for vid in range(1,451):
-        signup=start_signup + timedelta(days=random.randint(0,1100))
-        age=int(min(90,max(16,round(random.gauss(33,12)))))
-        volunteers.append((vid,signup.isoformat(),age,choose_weighted(experience_levels,[0.55,0.33,0.12]),random.choice(regions)))
-    conn.executemany("INSERT INTO volunteers VALUES (?,?,?,?,?)", volunteers)
+        CREATE TABLE samples (
+            sample_id INTEGER PRIMARY KEY,
+            beach_id INTEGER NOT NULL,
+            collection_date TEXT NOT NULL,
+            collection_method TEXT NOT NULL CHECK (collection_method IN ('Transect','Quadrat','Grab','Sieve')),
+            polymer_type TEXT,
+            plastic_density_mg_m2 REAL NOT NULL CHECK (plastic_density_mg_m2 >= 0),
+            severity TEXT NOT NULL CHECK (severity IN ('Low','Moderate','High','Critical')),
+            FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
+        );
 
-    event_start=date(2024,1,1)
-    event_end=date(2026,2,15)
-    num_days=(event_end-event_start).days+1
+        CREATE TABLE lab_results (
+            lab_result_id INTEGER PRIMARY KEY,
+            sample_id INTEGER NOT NULL UNIQUE,
+            microplastic_count INTEGER NOT NULL CHECK (microplastic_count >= 0),
+            size_class TEXT NOT NULL CHECK (size_class IN ('Small','Medium','Large')),
+            analyst_confidence REAL,
+            notes TEXT,
+            FOREIGN KEY (sample_id) REFERENCES samples(sample_id)
+        );
 
-    events=[]
-    for eid in range(1,851):
-        d=event_start + timedelta(days=random.randint(0,num_days-1))
-        weather=choose_weighted(weather_types,[0.32,0.30,0.18,0.16,0.04])
-        if random.random() < 0.03:
-            weather=None
-        # Deliberate missingness: weather sometimes unrecorded.
-        events.append((eid,random.randint(1,30),d.isoformat(),choose_weighted(list(range(6,19)),[2,3,4,5,6,7,7,6,5,4,3,2,2]),int(max(15,min(360,round(random.gauss(140,55))))),float(seasonal_temp_c(d)),weather))
-    conn.executemany("INSERT INTO cleanup_events VALUES (?,?,?,?,?,?,?)", events)
+        CREATE TABLE cleanup_events (
+            event_id INTEGER PRIMARY KEY,
+            beach_id INTEGER NOT NULL,
+            event_date TEXT NOT NULL,
+            event_type TEXT NOT NULL CHECK (event_type IN ('Cleanup','Awareness','Survey')),
+            sponsor TEXT NOT NULL,
+            bags_collected INTEGER NOT NULL CHECK (bags_collected >= 0),
+            FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
+        );
 
-    ev=[]
-    for (eid,beach_id,d,sh,dur,temp,wea) in events:
-        n=int(max(3,min(30,round(random.gauss(11,4)))))
-        vids=random.sample(range(1,451), k=min(n,450))
-        base_hours=min(6.0,max(1.0,dur/60.0 + random.gauss(0,0.3)))
-        for v in vids:
-            ev.append((eid,v,choose_weighted(roles,[0.55,0.25,0.12,0.08]),round(min(8.0,max(0.5,base_hours + random.gauss(0,0.4))),1)))
-    conn.executemany("INSERT INTO event_volunteers VALUES (?,?,?,?)", ev)
+        CREATE TABLE event_volunteers (
+            event_id INTEGER NOT NULL,
+            volunteer_id INTEGER NOT NULL,
+            hours_worked REAL NOT NULL CHECK (hours_worked >= 0),
+            role TEXT NOT NULL CHECK (role IN ('Leader','Helper','DataEntry','Safety')),
+            PRIMARY KEY (event_id, volunteer_id),
+            FOREIGN KEY (event_id) REFERENCES cleanup_events(event_id) ON DELETE CASCADE,
+            FOREIGN KEY (volunteer_id) REFERENCES volunteers(volunteer_id) ON DELETE CASCADE
+        );
 
-    samples=[]
-    for sid in range(1,5001):
-        beach_id=random.randint(1,30)
-        d=event_start + timedelta(days=random.randint(0,num_days-1))
-        polymer=choose_weighted(polymer_types,[0.22,0.20,0.18,0.10,0.05,0.08,0.07,0.10])
+        CREATE TABLE beach_daily_summary (
+            beach_id INTEGER NOT NULL,
+            summary_date TEXT NOT NULL,
+            sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+            avg_density_mg_m2 REAL NOT NULL CHECK (avg_density_mg_m2 >= 0),
+            dominant_severity TEXT NOT NULL CHECK (dominant_severity IN ('Low','Moderate','High','Critical')),
+            PRIMARY KEY (beach_id, summary_date),
+            FOREIGN KEY (beach_id) REFERENCES beaches(beach_id)
+        );
+        """
+    )
+
+    # beaches
+    beach_names = [
+        "Blue Cove", "Dune Shore", "Pebble Bay", "Seabrook Bay", "Brightwater Bay",
+        "Coral Point", "Windy Strand", "Harbor Sands", "Silver Beach", "Turtle Coast",
+        "Wavecrest", "Pine Dunes", "Sunset Reach", "Stormwatch", "Crystal Shore",
+        "Lighthouse Bay", "Crescent Beach", "Driftwood Cove", "Otter Bay", "Sapphire Sands",
+        "Moonlit Shore", "Cliffside Bay", "Golden Strand", "Seagrass Point", "Mariner's Cove",
+        "Palm Beach", "Cedar Coast", "Bluefin Bay", "Dolphin Shore", "Whispering Sands"
+    ]
+    regions = ["North", "South", "East", "West"]
+    beach_types = ["Sandy", "Rocky", "Mixed"]
+    access_levels = ["Easy", "Moderate", "Hard"]
+    protected = ["None", "Local", "National"]
+
+    beaches = []
+    for i in range(1, 31):
+        beaches.append(
+            (
+                i,
+                beach_names[i - 1],
+                choose_weighted(regions, [0.28, 0.28, 0.22, 0.22]),
+                choose_weighted(beach_types, [0.55, 0.20, 0.25]),
+                choose_weighted(access_levels, [0.60, 0.30, 0.10]),
+                round(max(0.5, random.gauss(3.8, 1.4)), 2),
+                choose_weighted(protected, [0.60, 0.25, 0.15]),
+            )
+        )
+    conn.executemany("INSERT INTO beaches VALUES (?,?,?,?,?,?,?)", beaches)
+
+    # volunteers
+    first = ["Sujith", "Asha", "Ravi", "Nina", "Omar", "Elena", "Ivy", "Noah", "Liam", "Maya", "Arjun", "Sara"]
+    last = ["Reddy", "Patel", "Khan", "Singh", "Brown", "Garcia", "Silva", "Lee", "Chen", "Jones", "Rossi", "Miller"]
+    levels = ["New", "Intermediate", "Experienced"]
+
+    volunteers = []
+    for vid in range(1, 481):
+        name = f"{random.choice(first)} {random.choice(last)}"
+        age = int(min(75, max(17, round(random.gauss(29, 10)))))
+        exp = choose_weighted(levels, [0.45, 0.35, 0.20])
+
+        # some missing contacts
+        email = f"user{vid}@mail.com" if random.random() > 0.05 else None
+        phone = f"+44 7{random.randint(100000000, 999999999)}" if random.random() > 0.08 else None
+
+        volunteers.append((vid, name, age, exp, email, phone))
+
+    conn.executemany("INSERT INTO volunteers VALUES (?,?,?,?,?,?)", volunteers)
+
+    # samples (main big table)
+    methods = ["Transect", "Quadrat", "Grab", "Sieve"]
+    polymers = ["PET", "PE", "PP", "PS", "PVC", "Nylon", "PU", "Other"]
+
+    samples = []
+    start_date = date(2024, 1, 1)
+
+    for sid in range(1, 5001):
+        beach_id = random.randint(1, 30)
+        d = start_date + timedelta(days=random.randint(0, 750))
+
+        density = max(0.0, random.lognormvariate(math.log(140), 0.55))
+        density = round(density, 1)
+
+        polymer = random.choice(polymers)
+
+        # some missing values
         if random.random() < 0.04:
-            polymer=None
-        # Deliberate missingness: polymer type sometimes unknown.
-        beach_risk=beaches[beach_id-1][5]
-        risk_mult={"Low":0.85,"Medium":1.0,"High":1.25,"Critical":1.6}[beach_risk]
-        density=max(0.0, random.lognormvariate(math.log(140),0.55)*risk_mult)
-        # Log-normal distribution produces realistic right-skewed pollution.
-        density=round(density,1)
-        samples.append((sid,beach_id,d.isoformat(),choose_weighted(collection_methods,[0.35,0.30,0.20,0.15]),polymer,float(density),severity_from_density(density)))
+            polymer = None
+
+        sev = severity_from_density(density)
+
+        samples.append(
+            (
+                sid,
+                beach_id,
+                d.isoformat(),
+                random.choice(methods),
+                polymer,
+                density,
+                sev,
+            )
+        )
+
     conn.executemany("INSERT INTO samples VALUES (?,?,?,?,?,?,?)", samples)
 
-    lab=[]
-    for rid,(sid,beach_id,cd,method,polymer,density,sev) in enumerate(samples, start=1):
-        count=int(max(0, round((density*random.uniform(0.9,1.3))*random.uniform(0.8,1.2))))
-        size=max(0.05, random.gauss(1.4,0.45))
-        if sev=="Severe": size*=0.75
-        elif sev=="High": size*=0.9
-        size=round(size,2)
-        conf=choose_weighted(confidence_levels,[0.12,0.45,0.43])
-        if random.random() < 0.03:
-            conf=None
-        # Deliberate missingness: analyst confidence not always recorded.
-        lab.append((rid,sid,count,float(size),choose_weighted(analysis_methods,[0.35,0.20,0.30,0.15]),conf))
-    conn.executemany("INSERT INTO lab_results VALUES (?,?,?,?,?,?)", lab)
+    # lab_results (1:1 with samples)
+    size_classes = ["Small", "Medium", "Large"]
+    lab_rows = []
+    for sid in range(1, 5001):
+        # count roughly linked to density
+        base = max(0, int(round(random.gauss(80, 25))))
+        extra = int(max(0, random.gauss(0.9 * (sid % 60), 10)))
+        count = base + extra
 
-    grp=defaultdict(list)
-    for (sid,beach_id,cd,method,polymer,density,sev) in samples:
-        grp[(beach_id,cd)].append((density,sev))
-    summary=[]
-    # beach_daily_summary has a composite key (beach_id, summary_date) for daily aggregates.
-    for beach_id in range(1,31):
-        keys=[k for k in grp.keys() if k[0]==beach_id]
-        random.shuffle(keys)
-        for (b,cd) in keys[:40]:
-            vals=grp[(b,cd)]
-            sc=len(vals)
-            avg=round(sum(v[0] for v in vals)/sc,1)
-            dom=Counter(v[1] for v in vals).most_common(1)[0][0]
-            summary.append((b,cd,sc,float(avg),dom))
-    conn.executemany("INSERT INTO beach_daily_summary VALUES (?,?,?,?,?)", summary)
+        size_class = choose_weighted(size_classes, [0.55, 0.30, 0.15])
+
+        conf = round(min(1.0, max(0.3, random.gauss(0.83, 0.12))), 2)
+
+        # a few NULL confidence
+        if random.random() < 0.028:
+            conf = None
+
+        note = None
+        if random.random() < 0.03:
+            note = "rechecked"
+
+        lab_rows.append((sid, sid, count, size_class, conf, note))
+
+    conn.executemany("INSERT INTO lab_results VALUES (?,?,?,?,?,?)", lab_rows)
+
+    # cleanup events
+    event_types = ["Cleanup", "Awareness", "Survey"]
+    sponsors = ["CoastalCare", "BlueOcean Club", "SeaWatch", "EcoPulse", "Local Council", "Uni Society"]
+
+    events = []
+    for eid in range(1, 881):
+        beach_id = random.randint(1, 30)
+        d = start_date + timedelta(days=random.randint(0, 750))
+        et = choose_weighted(event_types, [0.62, 0.18, 0.20])
+        sp = random.choice(sponsors)
+        bags = int(max(0, round(random.gauss(22, 10))))
+        events.append((eid, beach_id, d.isoformat(), et, sp, bags))
+
+    conn.executemany("INSERT INTO cleanup_events VALUES (?,?,?,?,?,?)", events)
+
+    # event_volunteers (composite key)
+    roles = ["Leader", "Helper", "DataEntry", "Safety"]
+    ev_rows = []
+    for (eid, _beach_id, _d, _et, _sp, _bags) in events:
+        n = random.randint(6, 14)
+        ids = random.sample(range(1, 481), n)
+        for j, vid in enumerate(ids):
+            role = "Leader" if j == 0 else choose_weighted(roles, [0.0, 0.72, 0.16, 0.12])
+            hrs = round(max(0.5, min(8.0, random.gauss(3.2, 1.2))), 1)
+            ev_rows.append((eid, vid, hrs, role))
+
+    conn.executemany("INSERT INTO event_volunteers VALUES (?,?,?,?)", ev_rows)
+
+    # beach_daily_summary
+    summary_rows = []
+    for _ in range(1200):
+        beach_id = random.randint(1, 30)
+        d = start_date + timedelta(days=random.randint(0, 750))
+
+        scount = int(max(0, round(random.gauss(4, 2))))
+        avg = round(max(0.0, random.lognormvariate(math.log(120), 0.45)), 1)
+        dom = severity_from_density(avg)
+
+        summary_rows.append((beach_id, d.isoformat(), scount, avg, dom))
+
+    # avoid PK clashes
+    conn.executemany(
+        "INSERT OR IGNORE INTO beach_daily_summary VALUES (?,?,?,?,?)",
+        summary_rows,
+    )
 
     conn.commit()
+
+    # quick prints
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM samples;")
+    print("samples:", cur.fetchone()[0])
+
+    cur.execute("SELECT COUNT(*) FROM lab_results;")
+    print("lab_results:", cur.fetchone()[0])
+
+    cur.execute("SELECT COUNT(*) FROM beach_daily_summary;")
+    print("beach_daily_summary:", cur.fetchone()[0])
+
     conn.close()
+    print("Created:", DB_PATH)
+
 
 if __name__ == "__main__":
     main()
