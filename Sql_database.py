@@ -16,7 +16,7 @@ def choose_weighted(options, weights):
     return options[-1]
 
 
-# density -> ordinal label
+# density
 def severity_from_density(d):
     if d < 60:
         return "Low"
@@ -170,7 +170,7 @@ def main():
 
     conn.executemany("INSERT INTO volunteers VALUES (?,?,?,?,?,?)", volunteers)
 
-    # samples (main big table)
+    # samples 
     methods = ["Transect", "Quadrat", "Grab", "Sieve"]
     polymers = ["PET", "PE", "PP", "PS", "PVC", "Nylon", "PU", "Other"]
 
